@@ -72,9 +72,19 @@ The main menu provides access to all the core features:
 - **Rules:** Firewall rules are stored in `~/.config/pf-tui/rules.json`.
 - **Logs:** Application logs are stored in `~/.config/pf-tui/pf-tui.log`. Startup script logs are in `/tmp/pf-tui-startup.log`.
 
+## Configuration Files
+
+`pf-tui` uses two main files to manage your firewall configuration:
+
+*   **`~/.config/pf-tui/rules.json`**: This is your primary configuration file. It stores all your firewall and port forwarding rules in a structured JSON format. This file allows `pf-tui` to load, display, and manage your rules with all their details, including descriptions. When you "Save Configuration", you are saving to this file.
+
+*   **`/etc/pf.anchors/pf-tui.rules`**: This is the file that the macOS firewall (`pfctl`) actually uses. When you "Save & Apply Rules to System", `pf-tui` translates the rules from your `rules.json` file into the `pfctl`-compatible format and saves them to this anchor file. The system's firewall then loads the rules from this anchor.
+
+It is necessary to keep both files. The `rules.json` file is the "source of truth" for the application, ensuring that your rule details and descriptions are preserved. The `pf-tui.rules` anchor is the "compiled" version of your rules that the operating system understands.
+
 ## How It Works
 
-The TUI uses the `curses` library to create the terminal interface. It interacts with the system's `pfctl` utility to manage the firewall. Rules are managed through a dedicated anchor file (`/etc/pf.anchors/pf-tui`) to avoid interfering with other system firewall configurations.
+The TUI uses the `curses` library to create the terminal interface. It interacts with the system's `pfctl` utility to manage the firewall. Rules are managed through a dedicated anchor file (`/etc/pf.anchors/pf-tui.rules`) to avoid interfering with other system firewall configurations.
 
 ## License
 

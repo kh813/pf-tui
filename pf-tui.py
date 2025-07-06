@@ -194,6 +194,37 @@ class FirewallManager:
             logging.error(f"Failed to save rules: {e}", exc_info=True)
             return False
 
+    def rule_exists(self, new_rule: 'FirewallRule') -> bool:
+        """Check if an identical filter rule already exists."""
+        for rule in self.rules:
+            if (
+                rule.action == new_rule.action and
+                rule.direction == new_rule.direction and
+                rule.interface == new_rule.interface and
+                rule.protocol == new_rule.protocol and
+                rule.source == new_rule.source and
+                rule.destination == new_rule.destination and
+                rule.port == new_rule.port and
+                rule.quick == new_rule.quick and
+                rule.keep_state == new_rule.keep_state
+            ):
+                return True
+        return False
+
+    def rdr_rule_exists(self, new_rule: 'PortForwardingRule') -> bool:
+        """Check if an identical RDR rule already exists."""
+        for rule in self.rdr_rules:
+            if (
+                rule.interface == new_rule.interface and
+                rule.protocol == new_rule.protocol and
+                rule.external_ip == new_rule.external_ip and
+                rule.external_port == new_rule.external_port and
+                rule.internal_ip == new_rule.internal_ip and
+                rule.internal_port == new_rule.internal_port
+            ):
+                return True
+        return False
+
     def _generate_pfctl_rules(self):
         """pfctl形式のルールファイルを生成"""
         try:
@@ -279,8 +310,8 @@ class FirewallManager:
                 pf_rule += " out"
 
             # インターフェース
-            if rule.interface and rule.interface != "any":
-                pf_rule += f" on {rule.interface}"
+            if rule.interface and rule.interface.strip() != "any":
+                pf_rule += f" on {rule.interface.strip()}"
 
             # プロトコル
             if rule.protocol and rule.protocol != "any":
@@ -319,10 +350,14 @@ class FirewallManager:
     def _convert_rdr_rule_to_pf(self, rule):
         """RDRルールをpf形式に変換"""
         try:
+            if not all([rule.interface, rule.protocol, rule.external_port, rule.internal_ip, rule.internal_port]):
+                logging.warning(f"Skipping invalid RDR rule due to missing fields: {rule}")
+                return None
+
             pf_rule = "rdr pass"
 
             # インターフェース
-            if rule.interface and rule.interface != "any":
+            if rule.interface and rule.interface.strip().lower() != "any":
                 pf_rule += f" on {rule.interface}"
 
             # プロトコル
@@ -330,14 +365,10 @@ class FirewallManager:
                 pf_rule += f" proto {rule.protocol}"
 
             # 外部ポート
-            pf_rule += f" from {rule.external_ip} to any port {rule.external_port}"
+            pf_rule += f" from any to {rule.external_ip} port {rule.external_port}"
 
             # 内部IP:ポート
             pf_rule += f" -> {rule.internal_ip} port {rule.internal_port}"
-
-            # コメント
-            # if rule.description:
-            #     pf_rule += f" # {rule.description}"
 
             return pf_rule
 
@@ -488,9 +519,17 @@ class FirewallManager:
             if rule.description:
                 config_lines.append(f"# {rule.description}")
 
-            line = (f"rdr on {rule.interface} proto {rule.protocol} "
-                    f"from {rule.external_ip} to any port {rule.external_port} -> "
-                    f"{rule.internal_ip} port {rule.internal_port}")
+            if not all([rule.interface, rule.protocol, rule.external_port, rule.internal_ip, rule.internal_port]):
+                logging.warning(f"Skipping invalid RDR rule due to missing fields: {rule}")
+                config_lines.append(f"# SKIPPED: Incomplete RDR rule: {rule}")
+                continue
+
+            if rule.interface.strip().lower() == "any":
+                line = (f"rdr pass proto {rule.protocol} "
+                        f"from any to {rule.external_ip} port {rule.external_port} -> "
+                        f"{rule.internal_ip} port {rule.internal_port}")
+            else:
+                line = f"rdr pass on {rule.interface} proto {rule.protocol} from any to {rule.external_ip} port {rule.external_port} -> {rule.internal_ip} port {rule.internal_port}"
             config_lines.append(line)
 
         if self.rdr_rules and self.rules:
@@ -646,7 +685,7 @@ class FirewallManager:
             # オプションで、ユーザーに通知することもできる
             # self.show_dialog(f"Warning: {fwd_message}", "warning")
 
-        anchor_name = "pf-tui"
+        anchor_name = "pf-tui.rules"
         anchor_file_path = f"/etc/pf.anchors/{anchor_name}"
         temp_file_path = "/tmp/pf_tui_rules_temp"
 
@@ -832,23 +871,46 @@ class FirewallManager:
     def get_current_rules(self):
         """現在のpfctlルールを取得"""
         logging.info("Attempting to get current pfctl rules.")
+        all_rules = []
         try:
             has_sudo, _ = self.check_sudo_access()
             if not has_sudo:
                 logging.warning("Sudo access not available for getting current rules.")
                 return []
 
-            command = ['sudo', 'pfctl', '-sr']
-            logging.info(f"Running command: {' '.join(command)}")
-            result = subprocess.run(command,
-                                    capture_output=True, text=True, timeout=5)
+            # First, get NAT rules
+            rules_anchor_name = "pf-tui.rules"
+            try:
+                nat_command = ['sudo', 'pfctl', '-a', rules_anchor_name, '-s', 'nat']
+                logging.info(f"Executing command: {' '.join(nat_command)}")
+                nat_result = subprocess.run(nat_command, capture_output=True, text=True, timeout=5)
+                if nat_result.returncode == 0 and nat_result.stdout.strip():
+                    all_rules.extend(nat_result.stdout.strip().split('\n'))
+            except Exception as e:
+                logging.warning(f"Could not get NAT rules: {e}")
+
+            # Then, get filter rules
+            #rules_anchor_name = "pf-tui.rules"
+            command = ['sudo', 'pfctl', '-a', rules_anchor_name, '-s', 'rules']
+            logging.info(f"Executing command: {' '.join(command)}")
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+
             if result.returncode == 0:
-                rules = result.stdout.strip().split('\n')
-                logging.info(f"Successfully retrieved {len(rules)} rules.")
-                return rules
+                stdout = result.stdout.strip()
+                if stdout and "no rules" not in stdout.lower():
+                    all_rules.extend(stdout.split('\n'))
             else:
-                logging.error(f"pfctl -sr failed: {result.stderr.strip()}")
-                return []
+                stderr = result.stderr.strip()
+                if "no such anchor" in stderr.lower():
+                    logging.warning(f"Anchor '{rules_anchor_name}' does not exist yet.")
+                else:
+                    logging.error(f"pfctl failed to get rules from anchor: {stderr}")
+
+            # Filter out lines containing ALTQ
+            final_rules = [rule for rule in all_rules if "ALTQ" not in rule]
+            logging.info(f"Successfully retrieved {len(final_rules)} rules.")
+            return final_rules
+
         except Exception as e:
             logging.error(f"Failed to get current rules: {e}", exc_info=True)
             return []
@@ -893,7 +955,7 @@ class FirewallManager:
 
         # 1. Modify /etc/pf.conf to load the anchor
         pf_conf_path = "/etc/pf.conf"
-        anchor_name = "pf-tui"
+        anchor_name = "pf-tui.rules"
         anchor_file_path = f"/etc/pf.anchors/{anchor_name}"
         anchor_load_line = f'load anchor "{anchor_name}" from "{anchor_file_path}"'
         try:
@@ -1026,7 +1088,7 @@ class FirewallManager:
                 return False, auth_message
 
         # 1. Save current rules to the anchor file for persistence
-        anchor_name = "pf-tui"
+        anchor_name = "pf-tui.rules"
         anchor_file_path = f"/etc/pf.anchors/{anchor_name}"
         anchor_config = self.generate_anchor_config()
         try:
@@ -1040,7 +1102,7 @@ class FirewallManager:
 
         # 2. Modify /etc/pf.conf to load the anchor
         pf_conf_path = "/etc/pf.conf"
-        anchor_load_line = f'load anchor "{os.path.splitext(anchor_name)[0]}" from "/etc/pf.anchors/{anchor_name}"'
+        anchor_load_line = f'load anchor "{anchor_name}" from "/etc/pf.anchors/{anchor_name}"'
         try:
             read_cmd = ['sudo', 'cat', pf_conf_path]
             result = subprocess.run(read_cmd, capture_output=True, text=True, check=True)
@@ -1123,7 +1185,7 @@ class FirewallManager:
 
         # 1. Comment out the anchor in /etc/pf.conf
         pf_conf_path = "/etc/pf.conf"
-        anchor_name = "pf-tui"
+        anchor_name = "pf-tui.rules"
         anchor_file_path = f"/etc/pf.anchors/{anchor_name}"
         anchor_load_line = f'load anchor "{anchor_name}" from "{anchor_file_path}"'
         try:
@@ -1180,7 +1242,7 @@ class FirewallManager:
 
         # 1. Comment out the anchor in /etc/pf.conf
         pf_conf_path = "/etc/pf.conf"
-        anchor_name = "pf-tui"
+        anchor_name = "pf-tui.rules"
         anchor_file_path = f"/etc/pf.anchors/{anchor_name}"
         anchor_load_line = f'load anchor "{anchor_name}" from "{anchor_file_path}"'
         try:
@@ -1247,7 +1309,7 @@ class MyTextbox(curses.textpad.Textbox):
 
         if ch == 27:  # ESC
             self.cancelled = True
-            return 1
+            return 0
 
         if ch in (curses.KEY_BACKSPACE, 127, 8, 263):
             if x > 0:
@@ -1309,7 +1371,7 @@ class FirewallTUI:
             "protocol": "tcp",
             "external_ip": "any",
             "external_port": "",
-            "internal_ip": "",
+            "internal_ip": "127.0.0.1",
             "internal_port": "",
             "description": ""
         }
@@ -1418,8 +1480,7 @@ class FirewallTUI:
         # メッセージ表示
         message_start_y = 2
         for i, line in enumerate(lines[:3]):  # 最大3行まで
-            line_x = (dialog_width - len(line)) // 2
-            self.safe_addstr(dialog_win, message_start_y + i, line_x, line)
+            self.safe_addstr(dialog_win, message_start_y + i, (dialog_width - len(line)) // 2, line)
 
         # ボタンテキスト
         if self.dialog_type == "confirm":
@@ -1427,8 +1488,7 @@ class FirewallTUI:
         else:
             button_text = "[Enter] or [Esc] to close"
 
-        button_x = (dialog_width - len(button_text)) // 2
-        self.safe_addstr(dialog_win, dialog_height - 2, button_x, button_text[:dialog_width - 2], curses.A_BOLD)
+        self.safe_addstr(dialog_win, dialog_height - 2, (dialog_width - len(button_text)) // 2, button_text[:dialog_width - 2], curses.A_BOLD)
         dialog_win.refresh()
 
     def draw_header(self):
@@ -1460,7 +1520,7 @@ class FirewallTUI:
             "Save Configuration",
             "Import Configuration",
             "---",
-            "Show Current System Rules",
+            "Show Current Rules",
             "Show Info",
             "---", # セパレータ
             f"PF Status: {self.pf_status}",
@@ -1517,8 +1577,7 @@ class FirewallTUI:
 
         # ステータスメッセージ
         if self.status_message:
-            message = self.status_message[:curses.COLS - 4]
-            self.safe_addstr(self.stdscr, curses.LINES - 2, 2, message, curses.color_pair(3))
+            self.safe_addstr(self.stdscr, curses.LINES - 2, 2, self.status_message[:curses.COLS - 4], curses.color_pair(3))
 
         help_text = "Arrows: Navigate | Enter: Select | q: Quit"
         self.safe_addstr(self.stdscr, curses.LINES - 1, 2, help_text[:curses.COLS - 3])
@@ -1527,7 +1586,7 @@ class FirewallTUI:
         """Draw the pf info screen."""
         self.stdscr.clear()
         self.draw_header()
-        self.safe_addstr(self.stdscr, 2, 2, "Live PF Info (refreshes every 5s)", curses.A_BOLD)
+        self.safe_addstr(self.stdscr, 2, 2, "Live PF Info (refreshes every 1s)", curses.A_BOLD)
 
         info_window_height = curses.LINES - 7
         info_win = self.stdscr.subwin(info_window_height, curses.COLS - 4, 4, 2)
@@ -1935,6 +1994,12 @@ class FirewallTUI:
                 else:
                     self.mode = "edit_rule"
                     self.edit_selection = 0
+            elif selection_text == "Show Current Rules":
+                self.log_view_content = self.firewall.get_current_rules()
+                if not self.log_view_content:
+                    self.log_view_content = ["No active rules found."]
+                self.log_view_title = "Current Live PF Rules"
+                self.mode = "view_log"
             elif selection_text == "Save & Apply Rules to System":
                 if not self.firewall.rules:
                     self.show_dialog("No rules to apply. Please add rules first.", "error")
@@ -2101,13 +2166,14 @@ class FirewallTUI:
 
 
     def draw_add_rdr_rule_screen(self):
-        """RDRルール追加画面を描画"""
+        """ポートフォワーディングルール追加画面を描画"""
         self.stdscr.clear()
         self.draw_header()
-        self.safe_addstr(self.stdscr, 2, 2, "Add/Edit New Port Forwarding Rule", curses.A_BOLD)
+
+        self.safe_addstr(self.stdscr, 2, 2, "Add/Edit Port Forwarding Rule", curses.A_BOLD)
 
         form_fields = [
-            ("Interface", None),
+            ("Interface", ["any"]),
             ("Protocol", ["tcp", "udp"]),
             ("External IP", None),
             ("External Port", None),
@@ -2116,26 +2182,15 @@ class FirewallTUI:
             ("Description", None)
         ]
 
-        # パフォーマンス改善：空白文字列を一度だけ計算
-        blank_line = ' ' * (curses.COLS - 5)
-
         y = 4
         for i, (field, options) in enumerate(form_fields):
             y_pos = y + i
             is_selected = (i == self.form_field)
             field_key = field.lower().replace(' ', '_')
+            current_value = self.form_data.get(field_key, self.rdr_form_defaults.get(field_key, ''))
 
-            # デフォルト値を適切に取得（draw_add_rule_screenと同じロジック）
-            current_value = self.form_data.get(field_key, self.form_defaults.get(field_key))
-            # None の場合は空文字列にする
-            if current_value is None:
-                current_value = ""
-
-            # Set background for the whole line if selected
             line_attr = curses.color_pair(2) if is_selected else curses.A_NORMAL
-            self.safe_addstr(self.stdscr, y_pos, 4, blank_line, line_attr)
-
-            # Draw field label
+            self.safe_addstr(self.stdscr, y_pos, 4, ' ' * (curses.COLS - 5), line_attr)
             self.safe_addstr(self.stdscr, y_pos, 4, f"{field:15}: ", line_attr)
             x_pos = 4 + 17
 
@@ -2144,35 +2199,28 @@ class FirewallTUI:
                     attr = line_attr
                     if opt == current_value:
                         attr |= curses.A_REVERSE
-                    self.safe_addstr(self.stdscr, y_pos, x_pos, opt[:curses.COLS - x_pos - 1], attr)
+                    self.safe_addstr(self.stdscr, y_pos, x_pos, opt, attr)
                     x_pos += len(opt) + 2
             else:
-                # For free-text fields
-                self.safe_addstr(self.stdscr, y_pos, x_pos, current_value[:curses.COLS - x_pos - 1], line_attr)
+                self.safe_addstr(self.stdscr, y_pos, x_pos, current_value, line_attr)
                 x_pos += len(current_value)
 
-                # ヒントメッセージを追加（draw_add_rule_screenと同様）
+                hint = ""
                 if not options:
-                    hint = ""
-                    if field.lower() == 'interface' and current_value == 'any':
+                    if field == "External IP" and current_value == "any":
                         hint = "  <-- Press Enter to specify"
-                    elif field.lower() == 'external ip' and current_value == 'any':
-                        hint = "  <-- Press Enter to specify (e.g., 0.0.0.0/0, 192.168.1.0/24)"
-                    elif field.lower() == 'description' and not current_value:
+                    elif field == "Internal IP":
+                        hint = "  <-- Press Enter to specify (e.g., 192.168.1.100)"
+                    elif not current_value:
                         hint = "  <-- Press Enter to specify"
-                    
-                    if hint and x_pos + len(hint) < curses.COLS - 5:
-                        self.safe_addstr(self.stdscr, y_pos, x_pos, hint[:curses.COLS - x_pos - 1], line_attr)
+
+                if hint and x_pos + len(hint) < curses.COLS - 5:
+                    self.safe_addstr(self.stdscr, y_pos, x_pos, hint, line_attr)
 
         y += len(form_fields) + 2
         self.safe_addstr(self.stdscr, y, 4, "Instructions:", curses.A_BOLD)
-        self.safe_addstr(self.stdscr, y + 1, 4, "Up/Down: Navigate fields"[:curses.COLS - 5])
-        self.safe_addstr(self.stdscr, y + 2, 4, "Left/Right: Change value for fields with options"[:curses.COLS - 5])
-        self.safe_addstr(self.stdscr, y + 3, 4, "Enter: Edit value for text fields"[:curses.COLS - 5])
-        self.safe_addstr(self.stdscr, y + 4, 4, "'s': Save rule | Esc: Cancel"[:curses.COLS - 5])
-
-        if self.status_message:
-            self.safe_addstr(self.stdscr, curses.LINES - 2, 2, self.status_message[:curses.COLS - 3])
+        self.safe_addstr(self.stdscr, y + 1, 4, "Up/Down: Navigate | Left/Right: Change value | Enter: Edit value")
+        self.safe_addstr(self.stdscr, y + 2, 4, "'s': Save rule | Esc: Cancel")
 
     def handle_add_rdr_rule_input(self, key):
         """RDRルール追加・編集画面での入力処理"""
@@ -2281,6 +2329,9 @@ class FirewallTUI:
                     self.status_message = "RDR rule updated successfully!"
                     self.editing_rule_index = None
                 else:
+                    if self.firewall.rdr_rule_exists(rule):
+                        self.show_dialog("Error: An identical port forwarding rule already exists.", "error")
+                        return
                     self.firewall.rdr_rules.append(rule)
                     self.status_message = "RDR rule added successfully!"
                 self.mode = "main"
@@ -2418,6 +2469,9 @@ class FirewallTUI:
                     self.edit_selection = self.editing_rule_index
                     self.editing_rule_index = None
                 else:
+                    if self.firewall.rule_exists(rule):
+                        self.show_dialog("Error: An identical filter rule already exists.", "error")
+                        return
                     self.firewall.rules.append(rule)
                     self.status_message = "Rule added successfully!"
                     # Select the newly added rule
@@ -2453,12 +2507,12 @@ class FirewallTUI:
         """メインループ"""
         logging.info("Starting main loop.")
         while True:
-            # 5秒ごとに情報を更新
+            # 1秒ごとに情報を更新
             if self.mode == "show_info":
-                if time.time() - self.last_info_refresh > 5:
+                if time.time() - self.last_info_refresh >= 1:
                     _, self.info_view_content = self.firewall.get_pf_info(self.stdscr)
                     self.last_info_refresh = time.time()
-                self.stdscr.timeout(1000) # 1秒待機
+                self.stdscr.timeout(1000)  # 1秒のタイムアウト
             else:
                 self.stdscr.timeout(-1) # 通常はブロック
 
