@@ -879,9 +879,8 @@ class FirewallManager:
                 return []
 
             # First, get NAT rules
-            rules_anchor_name = "pf-tui.rules"
             try:
-                nat_command = ['sudo', 'pfctl', '-a', rules_anchor_name, '-s', 'nat']
+                nat_command = ['sudo', 'pfctl', '-a', 'pf-tui', '-s', 'nat']
                 logging.info(f"Executing command: {' '.join(nat_command)}")
                 nat_result = subprocess.run(nat_command, capture_output=True, text=True, timeout=5)
                 if nat_result.returncode == 0 and nat_result.stdout.strip():
@@ -890,7 +889,7 @@ class FirewallManager:
                 logging.warning(f"Could not get NAT rules: {e}")
 
             # Then, get filter rules
-            #rules_anchor_name = "pf-tui.rules"
+            rules_anchor_name = "pf-tui.rules"
             command = ['sudo', 'pfctl', '-a', rules_anchor_name, '-s', 'rules']
             logging.info(f"Executing command: {' '.join(command)}")
             result = subprocess.run(command, capture_output=True, text=True, timeout=5)

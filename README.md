@@ -24,7 +24,7 @@ A Terminal User Interface (TUI) for managing the macOS firewall (`pfctl`).
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/pf-tui.git
+    git clone https://github.com/kh813/pf-tui.git
     cd pf-tui
     ```
 
